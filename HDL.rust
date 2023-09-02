@@ -1,0 +1,141 @@
+use actix_web::{get, post, put, web, App, HttpResponse, HttpServer, Responder};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+use sqlx::migrate::Migrator;
+use sqlx::migrate::MigrateError;
+use sqlx::migrate::MigrateFile;
+use sqlx::migrate::MigratorOptions;
+use sqlx::migrate::MigrateCommand;
+use sqlx::query;
+use sqlx::Error;
+use std::convert::From;
+use thiserror::Error;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct User {
+    id: i64,
+    name: String,
+    age: i32,
+}
+
+#[derive(Error, Debug)]
+enum ServiceError {
+    #[error("Database error: {0}")]
+    DbError(#[from] sqlx::Error),
+
+    #[error("Migration error: {0}")]
+    MigrationError(#[from] MigrateError),
+
+    #[error("User not found")]
+    UserNotFound,
+
+    #[error("Invalid request data")]
+    InvalidData,
+}
+
+impl Responder for ServiceError {
+    fn respond_to(self, _: &actix_web::HttpRequest) -> actix_web::HttpResponse {
+        match self {
+            ServiceError::DbError(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
+            ServiceError::MigrationError(_) => HttpResponse::InternalServerError().body("Migration Error"),
+            ServiceError::UserNotFound => HttpResponse::NotFound().body("User not found"),
+            ServiceError::InvalidData => HttpResponse::BadRequest().body("Invalid data"),
+        }
+    }
+}
+
+#[get("/users")]
+async fn get_users(pool: web::Data<SqlitePool>) -> Result<HttpResponse, ServiceError> {
+    let users = query!("SELECT id, name, age FROM users")
+        .fetch_all(pool.get_ref())
+        .await?;
+
+    Ok(HttpResponse::Ok().json(users))
+}
+
+#[get("/users/{id}")]
+async fn get_user(
+    pool: web::Data<SqlitePool>,
+    web::Path(id): web::Path<i64>,
+) -> Result<HttpResponse, ServiceError> {
+    let user = query!("SELECT id, name, age FROM users WHERE id = ?", id)
+        .fetch_optional(pool.get_ref())
+        .await?;
+
+    match user {
+        Some(u) => Ok(HttpResponse::Ok().json(u)),
+        None => Err(ServiceError::UserNotFound),
+    }
+}
+
+#[post("/users")]
+async fn create_user(
+    pool: web::Data<SqlitePool>,
+    user: web::Json<User>,
+) -> Result<HttpResponse, ServiceError> {
+    let inserted = query!(
+        "INSERT INTO users (name, age) VALUES (?, ?)",
+        user.name,
+        user.age
+    )
+    .execute(pool.get_ref())
+    .await?;
+
+    if inserted.rows_affected() > 0 {
+        Ok(HttpResponse::Created().json(user.0))
+    } else {
+        Err(ServiceError::InvalidData)
+    }
+}
+
+#[put("/users/{id}")]
+async fn update_user(
+    pool: web::Data<SqlitePool>,
+    web::Path(id): web::Path<i64>,
+    updated_user: web::Json<User>,
+) -> Result<HttpResponse, ServiceError> {
+    let updated = query!(
+        "UPDATE users SET name = ?, age = ? WHERE id = ?",
+        updated_user.name,
+        updated_user.age,
+        id
+    )
+    .execute(pool.get_ref())
+    .await?;
+
+    if updated.rows_affected() > 0 {
+        Ok(HttpResponse::Ok().json(updated_user.0))
+    } else {
+        Err(ServiceError::UserNotFound)
+    }
+}
+
+#[actix_rt::main]
+async fn main() -> Result<(), ServiceError> {
+    let pool = SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename("test.db")
+            .create_if_missing(true)
+    ).await?;
+
+    Migrator::new(
+        MigratorOptions::new()
+            .migrations_dir("./migrations")
+    ).await?
+        .run(&pool)
+        .await?;
+
+    HttpServer::new(move || {
+        App::new()
+            .data(pool.clone())
+            .service(get_users)
+            .service(get_user)
+            .service(create_user)
+            .service(update_user)
+    })
+    .bind("127.0.0.1:8080")?
+    .run()
+    .await?;
+
+    Ok(())
+}
